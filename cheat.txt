@@ -1,4 +1,0 @@
-cd /d D:\FILEC\MinIO
-set MINIO_ROOT_USER=admin
-set MINIO_ROOT_PASSWORD=admin12345
-minio.exe server D:\FILEC\MinIO\data --console-address ":9001"

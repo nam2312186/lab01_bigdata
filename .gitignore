@@ -1,0 +1,49 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual envs (ignore local venvs)
+BigData311/
+venv/
+env/
+.venv/
+
+# Config / secrets
+.env
+*.env
+credentials
+*.pem
+*.key
+*.crt
+
+# IDEs / editors
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Build / caches / logs
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+.pytest_cache/
+*.log
+tmp/
+temp/
+
+# Spark / binaries / jars (environment artifacts)
+spark-*/
+**/jars/
+*.jar
+spark-*-bin-*/
+
+# IMPORTANT: do NOT ignore your input/output data — keep these tracked
+# (adjust names if your input data folder differs)
+!output_exercise/
+!*.csv
+!data/
