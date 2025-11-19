@@ -1,165 +1,208 @@
 import os
-from pyspark.sql import SparkSession, functions as F, types as T
 import pyspark
+from pyspark.sql import SparkSession, functions as F, types as T
 
 # =========================
-# 0. Config chung
+# 0. Cấu hình chung
 # =========================
 
-BROKERS = "203.205.33.134:29090,203.205.33.135:29091,203.205.33.136:29092"
+# CHỈ DÙNG 1 BROKER ĐANG SỐNG
+BROKERS = "203.205.33.134:29090"
 
 MOVIES_TOPIC  = "Gr6h50_movies"
 RATINGS_TOPIC = "Gr6h50_ratings"
 TAGS_TOPIC    = "Gr6h50_tags"
 
-OUTPUT_DIR = "output_exercise"   # thư mục chứa các file csv kết quả
+OUTPUT_DIR = "output_exercise"
 
 
 # =========================
-# 1. Khởi tạo Spark
+# 1. Khởi tạo Spark + Kafka connector 3.5.4 (Scala 2.12)
 # =========================
 def init_spark():
-    print("=== Init Spark for Exercises ===")
+    print("=== Init Spark for Exercises (Gr6h50) ===")
     print("PySpark version :", pyspark.__version__)
 
-    # Spark 4.0.1 (Scala 2.13) dùng connector _2.13:3.5.4
-    kafka_pkg = "org.apache.spark:spark-sql-kafka-0-10_2.13:3.5.4"
-    extra_pkgs = ",".join([
-        kafka_pkg,
-        "org.apache.kafka:kafka-clients:3.4.1"
-    ])
+    kafka_pkg = "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.4"
+    kafka_clients = "org.apache.kafka:kafka-clients:3.4.1"
 
     print("Kafka package   :", kafka_pkg)
 
-    spark = (
+    builder = (
         SparkSession.builder
-        .appName("Lab01-Exercises")
+        .appName("Lab01_Exercises_Gr6h50")
         .master("local[*]")
-        .config("spark.jars.packages", extra_pkgs)
-        .getOrCreate()
+        .config("spark.jars.packages", f"{kafka_pkg},{kafka_clients}")
+        .config("spark.sql.shuffle.partitions", "4")
     )
 
+    spark = builder.getOrCreate()
+    spark.sparkContext.setLogLevel("WARN")
     return spark
 
-# =========================
-# 2. Đọc dữ liệu từ Kafka
-# =========================
 
-def read_kafka_topic(spark, topic):
+# =========================
+# 2. Đọc 1 topic Kafka về DataFrame STRING
+# =========================
+def read_kafka_topic(spark, topic: str):
     print(f"\n=== Reading topic '{topic}' from brokers: {BROKERS} ===")
+
     df = (
         spark.read
         .format("kafka")
         .option("kafka.bootstrap.servers", BROKERS)
         .option("subscribe", topic)
         .option("startingOffsets", "earliest")
+        .option("endingOffsets", "latest")
+        .option("failOnDataLoss", "false")
         .load()
     )
 
-    # Kafka trả về: key (binary), value (binary), topic, partition, offset,...
-    # Ta chỉ cần value, cast sang STRING (JSON)
-    df_str = df.select(F.col("value").cast("string").alias("value"))
+    df_str = df.selectExpr("CAST(value AS STRING) AS value", "timestamp")
+
     print(f"Sample from topic {topic}:")
     df_str.show(5, truncate=False)
+    print(f"Total records in {topic} (raw) =", df_str.count())
     return df_str
 
 
 # =========================
-# 3. Parse JSON -> DataFrame chuẩn
+# 3. Parse JSON từng topic (JSON field đều là STRING)
 # =========================
-
 def parse_movies(df_str):
-    """
-    Parse JSON của movies:
-    {"movieId":"1","title":"Movie 1","genres":"Comedy"}
-    """
-    schema = T.StructType([
-        T.StructField("movieId", T.IntegerType(), True),
-        T.StructField("title",   T.StringType(),  True),
-        T.StructField("genres",  T.StringType(),  True),
+    # JSON: {"movieId": "1", "title": "Movie 1", "genres": "Comedy"}
+    schema_str = T.StructType([
+        T.StructField("movieId", T.StringType(), True),
+        T.StructField("title",   T.StringType(), True),
+        T.StructField("genres",  T.StringType(), True),
     ])
 
-    df_parsed = df_str.select(
-        F.from_json("value", schema).alias("data")
-    ).select("data.*")
+    raw = (
+        df_str
+        .select(F.from_json("value", schema_str).alias("data"))
+        .select("data.*")
+    )
 
-    print("\n[Movies] Parsed schema:")
-    df_parsed.printSchema()
-    df_parsed.show(5, truncate=False)
-    return df_parsed
+    parsed = (
+        raw
+        .withColumn("movieId", F.col("movieId").cast("int"))
+        .dropna(subset=["movieId"])
+    )
+
+    print("\n[DEBUG] Movies parsed count =", parsed.count())
+    parsed.show(5, truncate=False)
+    return parsed
 
 
 def parse_ratings(df_str):
-    """
-    Parse JSON của ratings:
-    {"userId":1,"movieId":1,"rating":4.0,"timestamp":123456789}
-    """
-    schema = T.StructType([
-        T.StructField("userId",    T.IntegerType(), True),
-        T.StructField("movieId",   T.IntegerType(), True),
-        T.StructField("rating",    T.DoubleType(),  True),
-        T.StructField("timestamp", T.LongType(),    True),
+    # JSON: {"userId": "36", "movieId": "22", "rating": "5", "timestamp": "1604..."}
+    schema_str = T.StructType([
+        T.StructField("userId",    T.StringType(), True),
+        T.StructField("movieId",   T.StringType(), True),
+        T.StructField("rating",    T.StringType(), True),
+        T.StructField("timestamp", T.StringType(), True),
     ])
 
-    df_parsed = df_str.select(
-        F.from_json("value", schema).alias("data")
-    ).select("data.*")
+    raw = (
+        df_str
+        .select(F.from_json("value", schema_str).alias("data"))
+        .select("data.*")
+    )
 
-    print("\n[Ratings] Parsed schema:")
-    df_parsed.printSchema()
-    df_parsed.show(5, truncate=False)
-    return df_parsed
+    parsed = (
+        raw
+        .withColumn("userId",    F.col("userId").cast("int"))
+        .withColumn("movieId",   F.col("movieId").cast("int"))
+        .withColumn("rating",    F.col("rating").cast("double"))
+        .withColumn("timestamp", F.col("timestamp").cast("long"))
+        .dropna(subset=["movieId", "rating"])
+    )
+
+    print("\n[DEBUG] Ratings parsed count =", parsed.count())
+    parsed.show(5, truncate=False)
+    return parsed
 
 
 def parse_tags(df_str):
-    """
-    Parse JSON của tags:
-    {"userId":1,"movieId":1,"tag":"funny","timestamp":123456789}
-    """
-    schema = T.StructType([
-        T.StructField("userId",    T.IntegerType(), True),
-        T.StructField("movieId",   T.IntegerType(), True),
-        T.StructField("tag",       T.StringType(),  True),
-        T.StructField("timestamp", T.LongType(),    True),
+    # JSON: {"userId": "28", "movieId": "53", "tag": "must-see", "timestamp": "1603..."}
+    schema_str = T.StructType([
+        T.StructField("userId",    T.StringType(), True),
+        T.StructField("movieId",   T.StringType(), True),
+        T.StructField("tag",       T.StringType(), True),
+        T.StructField("timestamp", T.StringType(), True),
     ])
 
-    df_parsed = df_str.select(
-        F.from_json("value", schema).alias("data")
-    ).select("data.*")
+    raw = (
+        df_str
+        .select(F.from_json("value", schema_str).alias("data"))
+        .select("data.*")
+    )
 
-    print("\n[Tags] Parsed schema:")
-    df_parsed.printSchema()
-    df_parsed.show(5, truncate=False)
-    return df_parsed
+    parsed = (
+        raw
+        .withColumn("userId",    F.col("userId").cast("int"))
+        .withColumn("movieId",   F.col("movieId").cast("int"))
+        .withColumn("timestamp", F.col("timestamp").cast("long"))
+        .dropna(subset=["movieId", "tag"])
+    )
+
+    print("\n[DEBUG] Tags parsed count =", parsed.count())
+    parsed.show(5, truncate=False)
+    return parsed
 
 
 # =========================
-# 4. Q1–Q4 + ghi CSV
+# 4. Các câu hỏi & xuất CSV
 # =========================
+def save_q1_samples(movies_df, ratings_df, tags_df):
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-def q1_top5_movies(ratings_df, movies_df):
-    """
-    Q1: Top 5 movies (by Id) by average rating, whose rating count > 30.
-    Ghi ra: output_exercise/q1_top5_movies.csv
-    """
-    print("\n=== Q1: Top 5 movies by avg rating (count > 30) ===")
+    (
+        movies_df.limit(20)
+        .coalesce(1)
+        .write.mode("overwrite")
+        .option("header", True)
+        .csv(os.path.join(OUTPUT_DIR, "q1_movies_sample"))
+    )
 
+    (
+        ratings_df.limit(20)
+        .coalesce(1)
+        .write.mode("overwrite")
+        .option("header", True)
+        .csv(os.path.join(OUTPUT_DIR, "q1_ratings_sample"))
+    )
+
+    (
+        tags_df.limit(20)
+        .coalesce(1)
+        .write.mode("overwrite")
+        .option("header", True)
+        .csv(os.path.join(OUTPUT_DIR, "q1_tags_sample"))
+    )
+
+    print("Q1: Saved samples to CSV under", OUTPUT_DIR)
+
+
+def solve_q2_top5_movies(ratings_df, movies_df):
     agg = (
-        ratings_df.groupBy("movieId")
+        ratings_df
+        .groupBy("movieId")
         .agg(
             F.count("*").alias("rating_count"),
             F.avg("rating").alias("avg_rating"),
         )
-        .filter(F.col("rating_count") > 30)
+        .filter(F.col("rating_count") > 10)
     )
 
     result = (
         agg.join(movies_df, on="movieId", how="left")
-        .orderBy(F.col("avg_rating").desc(), F.col("movieId"))
+        .select("movieId", "title", "rating_count", "avg_rating")
+        .orderBy(F.desc("avg_rating"))
         .limit(5)
     )
 
-    out_path = os.path.join(OUTPUT_DIR, "q1_top5_movies")
+    out_path = os.path.join(OUTPUT_DIR, "q2_top5_movies")
     (
         result.coalesce(1)
         .write.mode("overwrite")
@@ -167,40 +210,30 @@ def q1_top5_movies(ratings_df, movies_df):
         .csv(out_path)
     )
 
-    print(f"Q1 result written to: {out_path}")
+    print("Q2: Saved top 5 movies to", out_path)
     result.show(truncate=False)
     return result
 
 
-def q2_worst_tags(ratings_df, tags_df):
-    """
-    Q2: Get 5 worst tags (associated with lowest average rating).
-    Ý tưởng:
-      - Join ratings + tags theo movieId
-      - Group by tag -> avg(rating), count(*), count distinct movieId
-      - Lấy 5 tag có avg_rating thấp nhất
-    Ghi ra: output_exercise/q2_worst_tags.csv
-    """
-    print("\n=== Q2: 5 worst tags by avg rating ===")
-
+def solve_q3_worst_tags(ratings_df, tags_df):
     joined = (
-        ratings_df.select("movieId", "rating")
-        .join(tags_df.select("movieId", "tag"), on="movieId", how="inner")
+        ratings_df.join(tags_df, on="movieId", how="inner")
+        .filter(F.col("tag").isNotNull())
     )
 
     tag_stats = (
-        joined.groupBy("tag")
+        joined
+        .groupBy("tag")
         .agg(
-            F.countDistinct("movieId").alias("movie_count"),
             F.count("*").alias("rating_count"),
             F.avg("rating").alias("avg_rating"),
         )
-        # Có thể lọc thêm: chỉ xét tag xuất hiện >= vài lần nếu muốn
-        .orderBy(F.col("avg_rating").asc(), F.col("rating_count").desc())
+        .filter(F.col("rating_count") > 10)
+        .orderBy(F.asc("avg_rating"))
         .limit(5)
     )
 
-    out_path = os.path.join(OUTPUT_DIR, "q2_worst_tags")
+    out_path = os.path.join(OUTPUT_DIR, "q3_worst_tags")
     (
         tag_stats.coalesce(1)
         .write.mode("overwrite")
@@ -208,108 +241,76 @@ def q2_worst_tags(ratings_df, tags_df):
         .csv(out_path)
     )
 
-    print(f"Q2 result written to: {out_path}")
+    print("Q3: Saved 5 worst tags to", out_path)
     tag_stats.show(truncate=False)
     return tag_stats
 
 
-def q3_q4_movies_for_worst_tags(ratings_df, tags_df, movies_df, worst_tags_df):
-    """
-    Q3 + Q4:
-      - Với 5 tag tệ nhất (Q2):
-         + Check average rating của từng movie có các tag này
-         + Đếm bao nhiêu movie gắn các tag này
-    Ghi ra:
-      - output_exercise/q3_movies_with_worst_tags.csv
-      - output_exercise/q4_movies_count_per_worst_tag.csv
-    """
-    print("\n=== Q3 & Q4: Analyze movies for worst tags ===")
+def solve_q4_movies_for_worst_tags(ratings_df, tags_df, worst_tags_df, movies_df):
+    worst_tags_list = [row["tag"] for row in worst_tags_df.collect()]
+    print("Worst tags:", worst_tags_list)
 
-    worst_tags = [row["tag"] for row in worst_tags_df.collect()]
-    print("Worst tags:", worst_tags)
+    tags_filtered = tags_df.filter(F.col("tag").isin(worst_tags_list))
 
-    joined = (
-        ratings_df.select("movieId", "rating")
-        .join(tags_df.select("movieId", "tag"), on="movieId", how="inner")
-        .filter(F.col("tag").isin(worst_tags))
-    )
+    joined = ratings_df.join(tags_filtered, on="movieId", how="inner")
 
-    # Q3: Thống kê theo movie
-    movies_stats = (
-        joined.groupBy("movieId")
+    movie_tag_stats = (
+        joined
+        .groupBy("tag", "movieId")
         .agg(
-            F.collect_set("tag").alias("tags"),
             F.count("*").alias("rating_count"),
             F.avg("rating").alias("avg_rating"),
         )
+    )
+
+    movie_tag_stats = (
+        movie_tag_stats
         .join(movies_df, on="movieId", how="left")
-        .orderBy(F.col("avg_rating").asc())
+        .select("tag", "movieId", "title", "rating_count", "avg_rating")
+        .orderBy("tag", F.desc("avg_rating"))
     )
 
-    out_q3 = os.path.join(OUTPUT_DIR, "q3_movies_with_worst_tags")
+    out_path = os.path.join(OUTPUT_DIR, "q4_movies_per_worst_tag")
     (
-        movies_stats.coalesce(1)
+        movie_tag_stats.coalesce(1)
         .write.mode("overwrite")
         .option("header", True)
-        .csv(out_q3)
-    )
-    print(f"Q3 result written to: {out_q3}")
-    movies_stats.show(10, truncate=False)
-
-    # Q4: Đếm số movie per tag trong 5 worst tags
-    movies_per_tag = (
-        movies_stats
-        .select(F.explode("tags").alias("tag"), "movieId")
-        .distinct()
-        .groupBy("tag")
-        .agg(F.count("*").alias("movie_count"))
-        .orderBy("movie_count")
+        .csv(out_path)
     )
 
-    out_q4 = os.path.join(OUTPUT_DIR, "q4_movies_count_per_worst_tag")
-    (
-        movies_per_tag.coalesce(1)
-        .write.mode("overwrite")
-        .option("header", True)
-        .csv(out_q4)
-    )
-    print(f"Q4 result written to: {out_q4}")
-    movies_per_tag.show(truncate=False)
-
-    return movies_stats, movies_per_tag
+    print("Q4: Saved movies per worst tag to", out_path)
+    movie_tag_stats.show(50, truncate=False)
+    return movie_tag_stats
 
 
 # =========================
 # 5. Main
 # =========================
-
 def main():
     spark = init_spark()
 
-    # Đảm bảo thư mục output tồn tại
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    # 1) Đọc 3 topic từ Kafka
     movies_raw  = read_kafka_topic(spark, MOVIES_TOPIC)
     ratings_raw = read_kafka_topic(spark, RATINGS_TOPIC)
     tags_raw    = read_kafka_topic(spark, TAGS_TOPIC)
 
-    # 2) Parse JSON
     movies_df  = parse_movies(movies_raw)
     ratings_df = parse_ratings(ratings_raw)
     tags_df    = parse_tags(tags_raw)
 
-    # 3) Q1
-    q1_result = q1_top5_movies(ratings_df, movies_df)
+    print("\n=== Movies schema ===")
+    movies_df.printSchema()
+    print("\n=== Ratings schema ===")
+    ratings_df.printSchema()
+    print("\n=== Tags schema ===")
+    tags_df.printSchema()
 
-    # 4) Q2
-    worst_tags_df = q2_worst_tags(ratings_df, tags_df)
-
-    # 5) Q3 + Q4
-    q3_q4_movies_for_worst_tags(ratings_df, tags_df, movies_df, worst_tags_df)
+    save_q1_samples(movies_df, ratings_df, tags_df)
+    top5_df = solve_q2_top5_movies(ratings_df, movies_df)
+    worst_tags_df = solve_q3_worst_tags(ratings_df, tags_df)
+    _ = solve_q4_movies_for_worst_tags(ratings_df, tags_df, worst_tags_df, movies_df)
 
     spark.stop()
-    print("\n=== DONE Lab01 Exercises (Gr6h50) ===")
+    print("\n=== Done all questions (Q1–Q4) ===")
 
 
 if __name__ == "__main__":
